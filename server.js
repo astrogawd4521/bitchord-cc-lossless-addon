@@ -10,27 +10,38 @@ const API_KEY = process.env.MUSICCLOUD_API_KEY;
 
 const API = "https://api.musiccloud.io/api/v1";
 
-app.get("/manifest.json", (req, res) => {
-  res.json({
-    id: "dev.astrogawd.bitchord.lossless",
-    name: "CC Lossless",
-    version: "1.0.0",
-    resources: ["search", "stream"],
-    allowDownloads: 0,
-    settings: [
-      {
-        key: "quality",
-        type: "select",
-        default: "lossless",
-        options: [
-          { label: "Lossless", value: "lossless" }
-        ]
-      }
-    ]
-  });
+const MANIFEST = {
+  id: "dev.astrogawd.bitchord.lossless",
+  name: "CC Lossless",
+  version: "1.1.0",
+  resources: ["search", "stream"],
+  allowDownloads: 0,
+  settings: [
+    {
+      key: "quality",
+      type: "select",
+      default: "lossless",
+      options: [
+        { label: "Lossless", value: "lossless" }
+      ]
+    }
+  ]
+};
+
+app.get("/", (req, res) => {
+  res.send("BitChord CC Lossless addon is running.");
 });
 
-async function ccResolve(body) {
+app.get("/manifest.json", (req, res) => {
+  res.json(MANIFEST);
+});
+
+// MusicCloud API request
+async function resolveMusicCloud(body) {
+  if (!API_KEY) {
+    throw new Error("MusicCloud API key is missing");
+  }
+
   const response = await fetch(`${API}/cc/resolve`, {
     method: "POST",
     headers: {
@@ -41,12 +52,22 @@ async function ccResolve(body) {
   });
 
   if (!response.ok) {
-    throw new Error(`MusicCloud API error: ${response.status}`);
+    throw new Error(`MusicCloud returned ${response.status}`);
   }
 
   return response.json();
 }
 
+// Encode provider IDs before exposing them to BitChord
+function encodeId(id) {
+  return Buffer.from(String(id)).toString("base64url");
+}
+
+function decodeId(id) {
+  return Buffer.from(id, "base64url").toString("utf8");
+}
+
+// Format a track for BitChord
 function formatTrack(track, id) {
   return {
     id,
@@ -62,6 +83,7 @@ function formatTrack(track, id) {
   };
 }
 
+// SEARCH
 app.get("/search", async (req, res) => {
   const query = (req.query.q || "").trim();
 
@@ -69,78 +91,100 @@ app.get("/search", async (req, res) => {
     return res.json({ tracks: [] });
   }
 
-  if (!API_KEY) {
-    return res.status(503).json({
-      error: "MusicCloud API key is not configured"
-    });
-  }
-
   try {
-    const data = await ccResolve({ query });
+    const data = await resolveMusicCloud({ query });
+    let tracks = [];
 
-    if (data.status === "disambiguation") {
-      const tracks = data.candidates.map(candidate => ({
-        id: candidate.id,
-        title: candidate.title,
-        artist: (candidate.artists || []).join(", "),
-        album: candidate.albumName || "",
-        artworkURL: candidate.artworkUrl || undefined,
-        format: "flac",
-        audioQuality: "LOSSLESS"
-      }));
-
-      return res.json({ tracks });
-    }
-
+    // Directly resolved Creative Commons track
     if (data.type === "cc-track" && data.track) {
-      return res.json({
-        tracks: [
-          formatTrack(
-            data.track,
-            `jamendo:${data.track.jamendoId}`
-          )
-        ]
-      });
+      tracks.push(
+        formatTrack(
+          data.track,
+          `jamendo:${data.track.jamendoId}`
+        )
+      );
     }
 
-    return res.json({ tracks: [] });
+    // Text searches return candidate choices
+    else if (Array.isArray(data.candidates)) {
+      tracks = data.candidates
+        .filter(item => item.id && item.title)
+        .map(item => ({
+          id: `mc:${encodeId(item.id)}`,
+          title: item.title,
+          artist: Array.isArray(item.artists)
+            ? item.artists.join(", ")
+            : item.artistName || "",
+          album: item.albumName || "",
+          duration: item.durationMs
+            ? item.durationMs / 1000
+            : undefined,
+          artworkURL: item.artworkUrl || undefined,
+          format: "flac",
+          audioQuality: "LOSSLESS"
+        }));
+    }
+
+    res.json({ tracks });
 
   } catch (error) {
     console.error("Search error:", error.message);
-    return res.status(502).json({ tracks: [] });
+
+    res.status(502).json({
+      tracks: [],
+      error: "Music catalogue search failed"
+    });
   }
 });
 
+// STREAM
 app.get("/stream/:id", async (req, res) => {
   try {
     const id = req.params.id;
+    let jamendoId;
 
-    if (!API_KEY) {
-      return res.status(503).json({
-        error: "API key not configured"
-      });
+    // Direct Jamendo track ID
+    if (id.startsWith("jamendo:")) {
+      jamendoId = id.slice(8);
     }
 
-    const data = await ccResolve({
-      selectedCandidate: id
-    });
+    // Resolve an opaque MusicCloud candidate ID
+    else if (id.startsWith("mc:")) {
+      const candidateId = decodeId(id.slice(3));
 
-    if (data.type !== "cc-track" || !data.track?.jamendoId) {
+      const data = await resolveMusicCloud({
+        selectedCandidate: candidateId
+      });
+
+      if (
+        data.type !== "cc-track" ||
+        !data.track?.jamendoId
+      ) {
+        return res.status(404).json({
+          error: "No playable Creative Commons track found"
+        });
+      }
+
+      jamendoId = data.track.jamendoId;
+    }
+
+    else {
       return res.status(404).json({
-        error: "Track not found"
+        error: "Unknown track ID"
       });
     }
-
-    const jamendoId = data.track.jamendoId;
 
     if (!/^\d+$/.test(String(jamendoId))) {
       return res.status(400).json({
-        error: "Invalid track ID"
+        error: "Invalid Jamendo track ID"
       });
     }
 
+    const audioURL =
+      `${API}/cc/audio/${jamendoId}?format=flac`;
+
     res.json({
-      url: `${API}/cc/audio/${jamendoId}?format=flac`,
+      url: audioURL,
       format: "flac",
       quality: "Lossless FLAC",
       codec: "flac",
@@ -151,12 +195,14 @@ app.get("/stream/:id", async (req, res) => {
 
   } catch (error) {
     console.error("Stream error:", error.message);
+
     res.status(502).json({
-      error: "Unable to resolve audio"
+      error: "Unable to resolve audio stream"
     });
   }
 });
 
+// Start server
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`CC Lossless running on port ${PORT}`);
+  console.log(`BitChord addon running on port ${PORT}`);
 });
